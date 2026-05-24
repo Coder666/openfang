@@ -19,6 +19,13 @@ api_key_env = "ANTHROPIC_API_KEY"         # Environment variable holding API key
 decay_rate = 0.05                         # Memory confidence decay rate
 # sqlite_path = "~/.openfang/data/openfang.db"   # Optional: custom DB path
 
+# Inference time window restrictions (pause/sleep outside allowed hours)
+# [inference_window]
+# enabled = false                           # Enable time-window gating
+# start_hour = 9                            # Start hour of the window (0-23, e.g. 9 AM)
+# end_hour = 17                             # End hour of the window (0-23, e.g. 5 PM)
+# timezone = "America/New_York"             # Optional: specific timezone (falls back to local time)
+
 [network]
 listen_addr = "127.0.0.1:4200"           # OFP listen address
 # shared_secret = ""                      # Required for P2P authentication

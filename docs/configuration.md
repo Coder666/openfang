@@ -124,6 +124,13 @@ embedding_model = "all-MiniLM-L6-v2"
 consolidation_threshold = 10000
 decay_rate = 0.1
 
+# --- Inference Time Windows (Pause outside allowed hours) ---
+[inference_window]
+enabled = false                      # Enable time-window gating
+start_hour = 9                       # Allowed execution start hour (0-23, e.g. 9 AM)
+end_hour = 17                        # Allowed execution end hour (0-23, e.g. 5 PM)
+# timezone = "America/New_York"      # Optional timezone name (falls back to local system)
+
 # --- Network (OFP Wire Protocol) ---
 [network]
 listen_addresses = ["/ip4/0.0.0.0/tcp/0"]
@@ -354,6 +361,27 @@ decay_rate = 0.1
 | `embedding_model` | string | `"all-MiniLM-L6-v2"` | Model name used for generating vector embeddings for semantic memory search. |
 | `consolidation_threshold` | u64 | `10000` | Number of stored memories before automatic consolidation is triggered to merge and prune old entries. |
 | `decay_rate` | f32 | `0.1` | Memory confidence decay rate. `0.0` = no decay (memories never fade), `1.0` = aggressive decay. Values between 0.0 and 1.0. |
+
+---
+
+### `[inference_window]`
+
+Configures time-window restrictions for LLM inference calls, allowing the agent to pause/sleep outside allowed hours instead of failing.
+
+```toml
+[inference_window]
+enabled = false
+start_hour = 9
+end_hour = 17
+# timezone = "America/New_York"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Whether to enable time-window gating. When `true`, inference calls will block and sleep outside of the allowed hours. |
+| `start_hour` | u32 | `9` | The start hour (0-23) of the allowed execution window. |
+| `end_hour` | u32 | `17` | The end hour (0-23) of the allowed execution window. |
+| `timezone` | string or null | `null` | Optional timezone name (e.g. `"America/New_York"`, `"Europe/London"`, `"UTC"`). If not specified, falls back to the system's local timezone. |
 
 ---
 

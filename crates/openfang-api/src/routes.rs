@@ -11109,6 +11109,15 @@ pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoRespo
                     f("slack", "object", "Slack"),
                     f("whatsapp", "object", "WhatsApp")
                 ]
+            },
+            "inference_window": {
+                "hot_reloadable": true,
+                "fields": [
+                    f("enabled", "boolean", "Enable Time Window Restricting"),
+                    f("start_hour", "number", "Start Hour (0-23)"),
+                    f("end_hour", "number", "End Hour (0-23)"),
+                    f("timezone", "string", "Timezone (optional)")
+                ]
             }
         }
     }))

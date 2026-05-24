@@ -229,6 +229,75 @@ impl std::fmt::Debug for DriverConfig {
     }
 }
 
+/// A wrapper driver that intercepts completion requests and pauses/sleeps
+/// until the allowed hours window starts if currently outside.
+pub struct TimeWindowedDriver {
+    pub inner: std::sync::Arc<dyn LlmDriver>,
+    pub window_config: std::sync::Arc<std::sync::RwLock<openfang_types::config::InferenceWindowConfig>>,
+}
+
+impl TimeWindowedDriver {
+    pub fn new(
+        inner: std::sync::Arc<dyn LlmDriver>,
+        window_config: std::sync::Arc<std::sync::RwLock<openfang_types::config::InferenceWindowConfig>>,
+    ) -> Self {
+        Self { inner, window_config }
+    }
+
+    async fn wait_for_allowed_hours(&self) {
+        loop {
+            let config = {
+                let guard = self.window_config.read().unwrap();
+                guard.clone()
+            };
+
+            if !config.enabled {
+                break;
+            }
+
+            // Get current time in specified timezone (or local time)
+            let now = chrono::Utc::now();
+            use chrono::Timelike;
+            let hour = if let Some(ref tz_str) = config.timezone {
+                match tz_str.parse::<chrono_tz::Tz>() {
+                    Ok(tz) => now.with_timezone(&tz).hour(),
+                    Err(_) => now.with_timezone(&chrono::Local).hour(),
+                }
+            } else {
+                now.with_timezone(&chrono::Local).hour()
+            };
+
+            if config.is_allowed_hour(hour) {
+                break;
+            }
+
+            tracing::info!(
+                "Inference paused: outside allowed hours ({} to {}). Current hour is {}. Sleeping 30s...",
+                config.start_hour, config.end_hour, hour
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    }
+}
+
+#[async_trait]
+impl LlmDriver for TimeWindowedDriver {
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        self.wait_for_allowed_hours().await;
+        self.inner.complete(request).await
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    ) -> Result<CompletionResponse, LlmError> {
+        self.wait_for_allowed_hours().await;
+        self.inner.stream(request, tx).await
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,4 +415,124 @@ mod tests {
             }
         ));
     }
+
+    #[tokio::test]
+    async fn test_time_windowed_driver_disabled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct TestDriver {
+            call_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl LlmDriver for TestDriver {
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "done".to_string(),
+                        provider_metadata: None,
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    tool_calls: vec![],
+                    usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let inner = Arc::new(TestDriver {
+            call_count: call_count.clone(),
+        });
+
+        // Config disabled
+        let window_config = Arc::new(std::sync::RwLock::new(
+            openfang_types::config::InferenceWindowConfig {
+                enabled: false,
+                start_hour: 9,
+                end_hour: 17,
+                timezone: None,
+            },
+        ));
+
+        let driver = TimeWindowedDriver::new(inner, window_config);
+        let request = CompletionRequest {
+            model: "test".to_string(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+        };
+
+        let response = driver.complete(request).await.unwrap();
+        assert_eq!(response.text(), "done");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_time_windowed_driver_enabled_in_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct TestDriver {
+            call_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl LlmDriver for TestDriver {
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "done".to_string(),
+                        provider_metadata: None,
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    tool_calls: vec![],
+                    usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let inner = Arc::new(TestDriver {
+            call_count: call_count.clone(),
+        });
+
+        // Get current system local hour to dynamically configure the window to be open.
+        let now = chrono::Utc::now().with_timezone(&chrono::Local);
+        use chrono::Timelike;
+        let current_hour = now.hour();
+        let start_hour = current_hour;
+        let end_hour = (current_hour + 1) % 24;
+
+        // Config enabled, window covering current hour
+        let window_config = Arc::new(std::sync::RwLock::new(
+            openfang_types::config::InferenceWindowConfig {
+                enabled: true,
+                start_hour,
+                end_hour,
+                timezone: None,
+            },
+        ));
+
+        let driver = TimeWindowedDriver::new(inner, window_config);
+        let request = CompletionRequest {
+            model: "test".to_string(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+        };
+
+        let response = driver.complete(request).await.unwrap();
+        assert_eq!(response.text(), "done");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
 }
+

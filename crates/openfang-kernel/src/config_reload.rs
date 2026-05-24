@@ -45,6 +45,8 @@ pub enum HotAction {
     ReloadProviderUrls,
     /// Default model changed — update in-place without restart.
     UpdateDefaultModel,
+    /// Inference window config changed.
+    UpdateInferenceWindow,
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +242,11 @@ pub fn build_reload_plan(old: &KernelConfig, new: &KernelConfig) -> ReloadPlan {
     if field_changed(&old.provider_urls, &new.provider_urls) {
         plan.hot_actions.push(HotAction::ReloadProviderUrls);
     }
+
+    if field_changed(&old.inference_window, &new.inference_window) {
+        plan.hot_actions.push(HotAction::UpdateInferenceWindow);
+    }
+
 
     if field_changed(&old.provider_api_keys, &new.provider_api_keys) {
         plan.noop_changes

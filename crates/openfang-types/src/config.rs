@@ -934,6 +934,52 @@ impl Default for CanvasConfig {
     }
 }
 
+/// Configuration for restricting inference calls to certain hours.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct InferenceWindowConfig {
+    /// Whether to enable time-window gating for inference.
+    pub enabled: bool,
+    /// Start hour of the window (0-23). Default is 9 (9 AM).
+    pub start_hour: u32,
+    /// End hour of the window (0-23). Default is 17 (5 PM).
+    pub end_hour: u32,
+    /// Timezone name (e.g., "America/New_York", "Europe/London", "UTC").
+    /// If not configured, local system timezone or UTC is used.
+    pub timezone: Option<String>,
+}
+
+impl Default for InferenceWindowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_hour: 9,
+            end_hour: 17,
+            timezone: None,
+        }
+    }
+}
+
+impl InferenceWindowConfig {
+    /// Check if the given hour (0-23) is within the allowed time window.
+    pub fn is_allowed_hour(&self, hour: u32) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        if self.start_hour < self.end_hour {
+            hour >= self.start_hour && hour < self.end_hour
+        } else if self.start_hour > self.end_hour {
+            // Spans midnight, e.g. 22 to 6. Allowed if hour >= 22 OR hour < 6.
+            hour >= self.start_hour || hour < self.end_hour
+        } else {
+            // start_hour == end_hour, treat as always blocked (0h duration)
+            false
+        }
+    }
+}
+
+
+
 /// Shell/exec security mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1298,6 +1344,9 @@ pub struct KernelConfig {
     /// ```
     #[serde(default)]
     pub skills: HashMap<String, HashMap<String, String>>,
+    /// Inference time window restriction configuration.
+    #[serde(default)]
+    pub inference_window: InferenceWindowConfig,
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1540,6 +1589,7 @@ impl Default for KernelConfig {
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
             skills: HashMap::new(),
+            inference_window: InferenceWindowConfig::default(),
         }
     }
 }
@@ -3911,6 +3961,14 @@ impl KernelConfig {
         } else if self.web.fetch.timeout_secs > 120 {
             self.web.fetch.timeout_secs = 120;
         }
+
+        // Inference window hours: clamp to 0..=23
+        if self.inference_window.start_hour > 23 {
+            self.inference_window.start_hour = 23;
+        }
+        if self.inference_window.end_hour > 23 {
+            self.inference_window.end_hour = 23;
+        }
     }
 }
 
@@ -4698,4 +4756,78 @@ shell_env_passthrough = ["*"]
         let policy: ExecPolicy = toml::from_str(toml_str).unwrap();
         assert_eq!(policy.shell_env_passthrough, vec!["*"]);
     }
+
+    #[test]
+    fn test_inference_window_disabled() {
+        let config = InferenceWindowConfig {
+            enabled: false,
+            start_hour: 9,
+            end_hour: 17,
+            timezone: None,
+        };
+        // When disabled, every hour should be allowed.
+        for h in 0..24 {
+            assert!(config.is_allowed_hour(h));
+        }
+    }
+
+    #[test]
+    fn test_inference_window_normal_hours() {
+        let config = InferenceWindowConfig {
+            enabled: true,
+            start_hour: 9,
+            end_hour: 17,
+            timezone: None,
+        };
+        // Allowed: 9..17
+        assert!(!config.is_allowed_hour(8));
+        assert!(config.is_allowed_hour(9));
+        assert!(config.is_allowed_hour(12));
+        assert!(config.is_allowed_hour(16));
+        assert!(!config.is_allowed_hour(17));
+        assert!(!config.is_allowed_hour(18));
+    }
+
+    #[test]
+    fn test_inference_window_midnight_crossing() {
+        let config = InferenceWindowConfig {
+            enabled: true,
+            start_hour: 22,
+            end_hour: 6,
+            timezone: None,
+        };
+        // Allowed: >= 22 or < 6
+        assert!(config.is_allowed_hour(22));
+        assert!(config.is_allowed_hour(23));
+        assert!(config.is_allowed_hour(0));
+        assert!(config.is_allowed_hour(5));
+        assert!(!config.is_allowed_hour(6));
+        assert!(!config.is_allowed_hour(12));
+        assert!(!config.is_allowed_hour(21));
+    }
+
+    #[test]
+    fn test_inference_window_equal_hours() {
+        let config = InferenceWindowConfig {
+            enabled: true,
+            start_hour: 12,
+            end_hour: 12,
+            timezone: None,
+        };
+        // Equal hours = always blocked (0h window)
+        for h in 0..24 {
+            assert!(!config.is_allowed_hour(h));
+        }
+    }
+
+    #[test]
+    fn test_inference_window_clamp_bounds() {
+        let mut config = KernelConfig::default();
+        config.inference_window.start_hour = 25;
+        config.inference_window.end_hour = 30;
+        config.clamp_bounds();
+        assert_eq!(config.inference_window.start_hour, 23);
+        assert_eq!(config.inference_window.end_hour, 23);
+    }
 }
+

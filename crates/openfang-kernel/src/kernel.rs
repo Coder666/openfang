@@ -174,6 +174,8 @@ pub struct OpenFangKernel {
     /// boot-time `self.config.fallback_providers`". (#1129)
     pub fallback_providers_override:
         std::sync::RwLock<Option<Vec<openfang_types::config::FallbackProviderConfig>>>,
+    /// Hot-reloadable inference window configuration.
+    pub inference_window: Arc<std::sync::RwLock<openfang_types::config::InferenceWindowConfig>>,
     /// Per-agent message locks — serializes LLM calls for the same agent to prevent
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
@@ -1167,6 +1169,7 @@ impl OpenFangKernel {
         let initial_bindings = config.bindings.clone();
         let initial_broadcast = config.broadcast.clone();
         let auto_reply_engine = crate::auto_reply::AutoReplyEngine::new(config.auto_reply.clone());
+        let inference_window = Arc::new(std::sync::RwLock::new(config.inference_window.clone()));
 
         let kernel = Self {
             config,
@@ -1218,6 +1221,7 @@ impl OpenFangKernel {
             channel_adapters: dashmap::DashMap::new(),
             default_model_override: std::sync::RwLock::new(None),
             fallback_providers_override: std::sync::RwLock::new(None),
+            inference_window,
             agent_msg_locks: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
         };
@@ -4192,6 +4196,14 @@ impl OpenFangKernel {
                         .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
                     *guard = Some(new_config.fallback_providers.clone());
                 }
+                HotAction::UpdateInferenceWindow => {
+                    info!("Hot-reload: updating inference window configuration");
+                    let mut guard = self
+                        .inference_window
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    *guard = new_config.inference_window.clone();
+                }
                 _ => {
                     // Other hot actions (channels, web, browser, extensions, etc.)
                     // are logged but not applied here — they require subsystem-specific
@@ -5788,13 +5800,18 @@ impl OpenFangKernel {
             }
         }
 
-        if chain.len() > 1 {
-            return Ok(Arc::new(
+        let driver: Arc<dyn LlmDriver> = if chain.len() > 1 {
+            Arc::new(
                 openfang_runtime::drivers::fallback::FallbackDriver::with_models(chain),
-            ));
-        }
+            )
+        } else {
+            primary
+        };
 
-        Ok(primary)
+        Ok(Arc::new(openfang_runtime::llm_driver::TimeWindowedDriver::new(
+            driver,
+            self.inference_window.clone(),
+        )))
     }
 
     /// Connect to all configured MCP servers and cache their tool definitions.
