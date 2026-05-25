@@ -244,7 +244,8 @@ impl TimeWindowedDriver {
         Self { inner, window_config }
     }
 
-    async fn wait_for_allowed_hours(&self) {
+    async fn wait_for_allowed_hours(&self, tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>) {
+        let mut first_pause = true;
         loop {
             let config = {
                 let guard = self.window_config.read().unwrap();
@@ -268,7 +269,29 @@ impl TimeWindowedDriver {
             };
 
             if config.is_allowed_hour(hour) {
+                if !first_pause {
+                    if let Some(tx_channel) = tx {
+                        let _ = tx_channel.send(StreamEvent::PhaseChange {
+                            phase: "running".to_string(),
+                            detail: Some("Inference window opened. Resuming request...".to_string()),
+                        }).await;
+                    }
+                }
                 break;
+            }
+
+            if first_pause {
+                first_pause = false;
+                if let Some(tx_channel) = tx {
+                    let detail = format!(
+                        "Inference paused: outside allowed hours ({} to {}). Re-opens at {}:00.",
+                        config.start_hour, config.end_hour, config.start_hour
+                    );
+                    let _ = tx_channel.send(StreamEvent::PhaseChange {
+                        phase: "paused".to_string(),
+                        detail: Some(detail),
+                    }).await;
+                }
             }
 
             tracing::info!(
@@ -283,7 +306,7 @@ impl TimeWindowedDriver {
 #[async_trait]
 impl LlmDriver for TimeWindowedDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        self.wait_for_allowed_hours().await;
+        self.wait_for_allowed_hours(None).await;
         self.inner.complete(request).await
     }
 
@@ -292,7 +315,7 @@ impl LlmDriver for TimeWindowedDriver {
         request: CompletionRequest,
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<CompletionResponse, LlmError> {
-        self.wait_for_allowed_hours().await;
+        self.wait_for_allowed_hours(Some(&tx)).await;
         self.inner.stream(request, tx).await
     }
 }
@@ -534,5 +557,128 @@ mod tests {
         assert_eq!(response.text(), "done");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
-}
 
+    #[tokio::test]
+    async fn test_time_windowed_driver_feedback_gated() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct TestDriver {
+            call_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl LlmDriver for TestDriver {
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "done".to_string(),
+                        provider_metadata: None,
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    tool_calls: vec![],
+                    usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let inner = Arc::new(TestDriver {
+            call_count: call_count.clone(),
+        });
+
+        // Get current system local hour.
+        let now = chrono::Utc::now().with_timezone(&chrono::Local);
+        use chrono::Timelike;
+        let current_hour = now.hour();
+
+        // Create a closed window (starts in 2 hours, lasts 1 hour).
+        let start_hour = (current_hour + 2) % 24;
+        let end_hour = (current_hour + 3) % 24;
+
+        let window_config = Arc::new(std::sync::RwLock::new(
+            openfang_types::config::InferenceWindowConfig {
+                enabled: true,
+                start_hour,
+                end_hour,
+                timezone: None,
+            },
+        ));
+
+        let driver = Arc::new(TimeWindowedDriver::new(inner, window_config.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+
+        let request = CompletionRequest {
+            model: "test".to_string(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+        };
+
+        // Spawn stream call in a background thread since it sleeps
+        let driver_clone = driver.clone();
+        let request_clone = request.clone();
+        let handle = tokio::spawn(async move {
+            driver_clone.stream(request_clone, tx).await
+        });
+
+        // 1. Should immediately receive a paused phase change event
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("Timeout waiting for paused event")
+            .expect("Channel closed");
+
+        if let StreamEvent::PhaseChange { phase, detail } = event {
+            assert_eq!(phase, "paused");
+            assert!(detail.unwrap().contains("Inference paused"));
+        } else {
+            panic!("Expected PhaseChange event");
+        }
+
+        // Confirm inner driver has not been invoked
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+
+        // 2. Hot-reload/dynamically open the window
+        {
+            let mut guard = window_config.write().unwrap();
+            guard.start_hour = current_hour;
+            guard.end_hour = (current_hour + 1) % 24;
+        }
+
+        // 3. Should receive a running phase change event when it wakes up
+        let event2 = tokio::time::timeout(std::time::Duration::from_secs(35), rx.recv())
+            .await
+            .expect("Timeout waiting for running event")
+            .expect("Channel closed");
+
+        if let StreamEvent::PhaseChange { phase, detail } = event2 {
+            assert_eq!(phase, "running");
+            assert!(detail.unwrap().contains("Resuming request"));
+        } else {
+            panic!("Expected PhaseChange event");
+        }
+
+        // 4. Then we should receive text delta and content complete from inner
+        let event3 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("Timeout waiting for text delta")
+            .expect("Channel closed");
+
+        assert!(matches!(event3, StreamEvent::TextDelta { text } if text == "done"));
+
+        let event4 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("Timeout waiting for content complete")
+            .expect("Channel closed");
+
+        assert!(matches!(event4, StreamEvent::ContentComplete { .. }));
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.text(), "done");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+}

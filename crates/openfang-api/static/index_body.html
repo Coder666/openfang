@@ -619,7 +619,8 @@
                           </button>
                         </div>
                         <!-- Thinking indicator with animated dots -->
-                        <div class="message-bubble" x-show="msg.thinking" style="background:transparent;border:none;padding:4px 0">
+                        <div class="message-bubble" x-show="msg.thinking" style="background:transparent;border:none;padding:4px 0;display:flex;align-items:center;gap:8px">
+                          <span x-show="msg.text && msg.text.trim()" x-text="msg.text" style="font-size:0.9em;color:var(--text-dim)"></span>
                           <div class="typing-dots"><span></span><span></span><span></span></div>
                         </div>
                         <!-- Normal message content -->
